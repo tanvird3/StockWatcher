@@ -6,3 +6,6 @@ numpy>=1.26.0
 scipy>=1.13.0
 statsmodels>=0.14.2
 requests>=2.32.0
+yfinance>=0.2.58
+curl_cffi>=0.10.0
+

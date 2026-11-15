@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import math
-from datetime import datetime, timedelta
+import threading
+import time
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import quote_plus
 
@@ -18,6 +20,11 @@ import requests
 from shiny import App, reactive, render, ui
 from shinywidgets import output_widget, render_widget
 from statsmodels.tsa.holtwinters import Holt
+
+try:
+    import yfinance as yf  # Optional TLS-impersonated fallback
+except Exception:
+    yf = None
 
 # ------------------------------------------------------------------------------
 # Canadian Equity Universe
@@ -47,21 +54,78 @@ TSX_UNIVERSE = pd.DataFrame(
         ("SU.TO", "Suncor Energy Inc.", "TSX", "Energy"),
         ("XIU.TO", "iShares S&P/TSX 60 ETF", "TSX", "ETFs"),
         ("XEQT.TO", "iShares Core Equity ETF", "TSX", "ETFs"),
-        ("HIVE.V", "HIVE Digital Technologies", "TSXV", "Technology"),
+        ("HIVE.TO", "HIVE Digital Technologies", "TSX", "Technology"),
         ("NGD.TO", "New Gold Inc.", "TSX", "Materials & Gold"),
     ],
     columns=["symbol", "name", "exchange", "sector"],
 )
 
-SYMBOL_CHOICES = {
-    row["symbol"]: f"{row['symbol']} — {row['name']}"
-    for _, row in TSX_UNIVERSE.iterrows()
-}
+_SKIP_INSTRUMENT_TOKENS = (".PR.", ".PF.", ".DB", ".WT", ".RT", ".NT", ".NO")
+
+
+def load_full_tsx_directory() -> tuple[pd.DataFrame, dict[str, str]]:
+    rows: list[tuple[str, str, str, str]] = [
+        (r["symbol"], r["name"], r["exchange"], r["sector"]) for _, r in TSX_UNIVERSE.iterrows()
+    ]
+    seen: set[str] = {r[0] for r in rows}
+    choices: dict[str, str] = {
+        r[0]: f"{r[0]} — {r[1]} ({r[2]})" for r in rows
+    }
+
+    dir_urls = [
+        ("TSX", ".TO", "https://www.tsx.com/json/company-directory/search/tsx/.*"),
+        ("TSXV", ".V", "https://www.tsx.com/json/company-directory/search/tsxv/.*"),
+    ]
+    hdrs = {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://www.tsx.com/",
+    }
+    for exch, suffix, url in dir_urls:
+        try:
+            resp = requests.get(url, headers=hdrs, timeout=10)
+            if resp.status_code != 200:
+                continue
+            results = resp.json().get("results") or []
+            for item in results:
+                comp_name = (item.get("name") or "").strip()
+                instruments = item.get("instruments") or [
+                    {"symbol": item.get("symbol"), "name": comp_name}
+                ]
+                for inst in instruments:
+                    raw_sym = (inst.get("symbol") or "").strip().upper()
+                    if not raw_sym or any(tok in raw_sym for tok in _SKIP_INSTRUMENT_TOKENS):
+                        continue
+                    canon = f"{raw_sym}{suffix}"
+                    if canon in seen:
+                        continue
+                    seen.add(canon)
+                    label_name = comp_name or (inst.get("name") or raw_sym).strip()
+                    rows.append((canon, label_name, exch, f"{exch} Listed"))
+                    choices[canon] = f"{canon} — {label_name} ({exch})"
+        except Exception:
+            continue
+
+    return pd.DataFrame(rows, columns=["symbol", "name", "exchange", "sector"]), choices
+
+
+DIRECTORY_DF, SYMBOL_CHOICES = load_full_tsx_directory()
 
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
+
+TMX_GRAPHQL_URL = "https://app-money.tmx.com/graphql"
+_TMX_HEADERS = {
+    "Content-Type": "application/json",
+    "User-Agent": USER_AGENT,
+    "Accept": "application/json",
+    "Origin": "https://money.tmx.com",
+    "Referer": "https://money.tmx.com/",
+}
 
 _SESSION = requests.Session()
 _SESSION.headers.update(
@@ -72,6 +136,205 @@ _SESSION.headers.update(
     }
 )
 _CACHED_CRUMB: str | None = None
+_LAST_FETCH_ERROR: str | None = None
+
+_CACHE_LOCK = threading.Lock()
+_QUOTE_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+_FUND_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_MACRO_CACHE: tuple[float, dict[str, float | None]] | None = None
+
+
+def _safe_float(val: Any) -> float | None:
+    if val is None or val == "":
+        return None
+    try:
+        out = float(val)
+        return out if math.isfinite(out) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_tmx_symbol(symbol: str) -> str:
+    s = symbol.strip().upper()
+    if s == "^GSPTSE":
+        return "^TSX"
+    for suffix in (".TO", ".V", ".CN", ".NE"):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)]
+            break
+    if "-" in s and not s.startswith("^"):
+        s = s.replace("-", ".")
+    return s
+
+
+def _tmx_graphql(query: str, variables: dict[str, Any] | None = None, timeout: int = 10) -> dict[str, Any] | None:
+    payload: dict[str, Any] = {"query": query}
+    if variables:
+        payload["variables"] = variables
+    resp = _SESSION.post(TMX_GRAPHQL_URL, json=payload, headers=_TMX_HEADERS, timeout=timeout)
+    if resp.status_code != 200:
+        raise RuntimeError(f"TMX HTTP {resp.status_code}")
+    data = resp.json()
+    return data.get("data")
+
+
+def _tmx_fundamentals_from_quote(qdata: dict[str, Any]) -> dict[str, Any]:
+    div_y = _safe_float(qdata.get("dividendYield"))
+    roe = _safe_float(qdata.get("returnOnEquity"))
+    dte = _safe_float(qdata.get("totalDebtToEquity"))
+    return {
+        "sector": qdata.get("sector") or None,
+        "industry": qdata.get("industry") or None,
+        "summary": qdata.get("shortDescription") or None,
+        "market_cap": _safe_float(qdata.get("MarketCap")),
+        "trailing_pe": _safe_float(qdata.get("peRatio")),
+        "forward_pe": None,
+        "price_to_book": _safe_float(qdata.get("priceToBook")),
+        "peg_ratio": None,
+        "dividend_yield": (div_y / 100.0) if div_y is not None else None,
+        "payout_ratio": None,
+        "beta": _safe_float(qdata.get("beta")),
+        "roe": (roe / 100.0) if roe is not None else None,
+        "operating_margin": None,
+        "profit_margin": None,
+        "debt_to_equity": (dte * 100.0) if dte is not None else None,
+        "current_ratio": None,
+        "free_cash_flow": None,
+        "revenue_growth": None,
+        "target_mean": None,
+        "eps": _safe_float(qdata.get("eps")),
+    }
+
+
+def _fetch_tmx_quote_and_chart(symbol: str, chart_range: str = "1y") -> dict[str, Any] | None:
+    tmx_sym = _to_tmx_symbol(symbol)
+    quote_gql = """
+    query getQuoteBySymbol($symbol: String, $locale: String) {
+      getQuoteBySymbol(symbol: $symbol, locale: $locale) {
+        symbol
+        name
+        price
+        priceChange
+        percentChange
+        exchangeName
+        exShortName
+        volume
+        openPrice
+        dayHigh
+        dayLow
+        MarketCap
+        peRatio
+        prevClose
+        dividendYield
+        dividendAmount
+        weeks52high
+        weeks52low
+        beta
+        sector
+        industry
+        shortDescription
+        priceToBook
+        eps
+        returnOnEquity
+        totalDebtToEquity
+      }
+    }
+    """
+    q_res = _tmx_graphql(quote_gql, {"symbol": tmx_sym, "locale": "en"})
+    qdata = (q_res or {}).get("getQuoteBySymbol")
+    if not qdata or _safe_float(qdata.get("price")) is None:
+        return None
+
+    with _CACHE_LOCK:
+        _FUND_CACHE[symbol.strip().upper()] = (time.time(), _tmx_fundamentals_from_quote(qdata))
+
+    now_dt = datetime.now(timezone.utc)
+    end_str = now_dt.strftime("%Y-%m-%d")
+    range_days = {
+        "5d": 14,
+        "1mo": 35,
+        "3mo": 95,
+        "6mo": 185,
+        "1y": 370,
+        "5y": 5 * 366,
+    }.get(chart_range, 370)
+    start_str = (now_dt - timedelta(days=range_days)).strftime("%Y-%m-%d")
+
+    ts_gql = """
+    query getTimeSeriesData($symbol: String!, $freq: String, $start: String, $end: String) {
+      getTimeSeriesData(symbol: $symbol, freq: $freq, start: $start, end: $end) {
+        dateTime
+        open
+        high
+        low
+        close
+        volume
+      }
+    }
+    """
+    freq_order = ["minute", "day"] if chart_range == "5d" else (["week", "day"] if chart_range == "5y" else ["day"])
+    bars: list[dict[str, Any]] = []
+    for freq in freq_order:
+        ts_start = (now_dt - timedelta(days=10)).strftime("%Y-%m-%d") if freq == "minute" else start_str
+        ts_res = _tmx_graphql(ts_gql, {"symbol": tmx_sym, "freq": freq, "start": ts_start, "end": end_str})
+        cand = (ts_res or {}).get("getTimeSeriesData") or []
+        if len(cand) >= (8 if chart_range == "5d" else 5):
+            bars = cand
+            break
+        if len(cand) > len(bars):
+            bars = cand
+
+    if len(bars) < 2:
+        return None
+
+    df = pd.DataFrame(bars)
+    df["date"] = pd.to_datetime(df["dateTime"], utc=True).dt.tz_convert("America/Toronto")
+    for col in ("open", "high", "low", "close", "volume"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["close"]).sort_values("date").reset_index(drop=True)
+    if len(df) < 2:
+        return None
+
+    df["open"] = df["open"].fillna(df["close"])
+    df["high"] = df["high"].fillna(df[["open", "close"]].max(axis=1))
+    df["low"] = df["low"].fillna(df[["open", "close"]].min(axis=1))
+    df["volume"] = df["volume"].fillna(0.0)
+
+    price = _safe_float(qdata.get("price")) or float(df["close"].iloc[-1])
+    change = _safe_float(qdata.get("priceChange"))
+    prev_close = _safe_float(qdata.get("prevClose"))
+    if prev_close is None and change is not None:
+        prev_close = price - change
+    if prev_close is None:
+        prev_close = float(df["close"].iloc[-2])
+    if change is None:
+        change = price - prev_close
+    change_pct = _safe_float(qdata.get("percentChange"))
+    if change_pct is None:
+        change_pct = (change / prev_close) * 100.0 if prev_close > 0 else 0.0
+
+    raw_ex = (qdata.get("exShortName") or "").upper()
+    canon_sym = symbol.strip().upper()
+    if canon_sym == "^GSPTSE" or tmx_sym == "^TSX":
+        exch = "TSX Index"
+    elif "TSXV" in raw_ex or canon_sym.endswith(".V"):
+        exch = "TSXV"
+    else:
+        exch = raw_ex or "TSX"
+
+    return {
+        "symbol": canon_sym,
+        "name": qdata.get("name") or canon_sym,
+        "exchange": exch,
+        "currency": "CAD",
+        "price": float(price),
+        "prev_close": float(prev_close),
+        "change": float(change),
+        "change_pct": float(change_pct),
+        "high_52w": _safe_float(qdata.get("weeks52high")) or float(df["high"].max()),
+        "low_52w": _safe_float(qdata.get("weeks52low")) or float(df["low"].min()),
+        "candles": df[["date", "open", "high", "low", "close", "volume"]],
+    }
 
 
 def _get_yahoo_crumb(force: bool = False) -> str | None:
@@ -79,11 +342,11 @@ def _get_yahoo_crumb(force: bool = False) -> str | None:
     if not force and _CACHED_CRUMB:
         return _CACHED_CRUMB
     try:
-        _SESSION.get("https://fc.yahoo.com", timeout=8)
+        _SESSION.get("https://fc.yahoo.com", timeout=6)
     except Exception:
         pass
     try:
-        resp = _SESSION.get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=8)
+        resp = _SESSION.get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=6)
         if resp.status_code == 200:
             txt = resp.text.strip()
             if txt and not txt.startswith("{"):
@@ -93,7 +356,62 @@ def _get_yahoo_crumb(force: bool = False) -> str | None:
     return _CACHED_CRUMB
 
 
-def fetch_chart_quote(symbol: str, chart_range: str = "1y", interval: str = "1d") -> dict[str, Any] | None:
+def _fetch_yfinance_chart(symbol: str, chart_range: str = "1y", interval: str = "1d") -> dict[str, Any] | None:
+    if yf is None:
+        return None
+    try:
+        tkr = yf.Ticker(symbol.strip())
+        hist = tkr.history(period=chart_range, interval=interval, auto_adjust=False)
+        if hist is None or hist.empty or len(hist) < 2:
+            return None
+        hist = hist.reset_index()
+        date_col = "Datetime" if "Datetime" in hist.columns else "Date"
+        dt = pd.to_datetime(hist[date_col])
+        if dt.dt.tz is None:
+            dt = dt.dt.tz_localize("America/Toronto")
+        else:
+            dt = dt.dt.tz_convert("America/Toronto")
+        df = pd.DataFrame(
+            {
+                "date": dt,
+                "open": pd.to_numeric(hist["Open"], errors="coerce"),
+                "high": pd.to_numeric(hist["High"], errors="coerce"),
+                "low": pd.to_numeric(hist["Low"], errors="coerce"),
+                "close": pd.to_numeric(hist["Close"], errors="coerce"),
+                "volume": pd.to_numeric(hist["Volume"], errors="coerce").fillna(0.0),
+            }
+        ).dropna(subset=["close"])
+        if len(df) < 2:
+            return None
+        df["open"] = df["open"].fillna(df["close"])
+        df["high"] = df["high"].fillna(df[["open", "close"]].max(axis=1))
+        df["low"] = df["low"].fillna(df[["open", "close"]].min(axis=1))
+
+        fi = getattr(tkr, "fast_info", None)
+        price = _safe_float(getattr(fi, "last_price", None)) or float(df["close"].iloc[-1])
+        prev_close = _safe_float(getattr(fi, "previous_close", None)) or float(df["close"].iloc[-2])
+        change = price - prev_close
+        change_pct = (change / prev_close) * 100.0 if prev_close > 0 else 0.0
+        sym = symbol.strip().upper()
+        exch = "TSXV" if sym.endswith(".V") else ("TSX Index" if sym == "^GSPTSE" else "TSX")
+        return {
+            "symbol": sym,
+            "name": SYMBOL_CHOICES.get(sym, sym).split(" — ")[-1],
+            "exchange": exch,
+            "currency": "CAD",
+            "price": float(price),
+            "prev_close": float(prev_close),
+            "change": float(change),
+            "change_pct": float(change_pct),
+            "high_52w": float(df["high"].max()),
+            "low_52w": float(df["low"].min()),
+            "candles": df.reset_index(drop=True),
+        }
+    except Exception:
+        return None
+
+
+def _fetch_yahoo_direct_chart(symbol: str, chart_range: str = "1y", interval: str = "1d") -> dict[str, Any] | None:
     encoded = quote_plus(symbol.strip())
     urls = [
         f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded}?interval={interval}&range={chart_range}&includePrePost=false",
@@ -101,7 +419,7 @@ def fetch_chart_quote(symbol: str, chart_range: str = "1y", interval: str = "1d"
     ]
     for url in urls:
         try:
-            resp = _SESSION.get(url, timeout=10)
+            resp = _SESSION.get(url, timeout=8)
             if resp.status_code != 200:
                 continue
             payload = resp.json()
@@ -141,8 +459,8 @@ def fetch_chart_quote(symbol: str, chart_range: str = "1y", interval: str = "1d"
             change = price - prev_close
             change_pct = (change / prev_close) * 100.0 if prev_close > 0 else 0.0
 
-            sym = meta.get("symbol") or symbol
-            exch = "TSXV" if sym.upper().endswith(".V") else ("TSX Index" if sym == "^GSPTSE" else "TSX")
+            sym = (meta.get("symbol") or symbol).upper()
+            exch = "TSXV" if sym.endswith(".V") else ("TSX Index" if sym == "^GSPTSE" else "TSX")
             return {
                 "symbol": sym,
                 "name": meta.get("longName") or meta.get("shortName") or sym,
@@ -154,14 +472,91 @@ def fetch_chart_quote(symbol: str, chart_range: str = "1y", interval: str = "1d"
                 "change_pct": change_pct,
                 "high_52w": float(meta.get("fiftyTwoWeekHigh") or df["high"].max()),
                 "low_52w": float(meta.get("fiftyTwoWeekLow") or df["low"].min()),
-                "candles": df.reset_index(drop=True),
+                "candles": df[["date", "open", "high", "low", "close", "volume"]].reset_index(drop=True),
             }
         except Exception:
             continue
     return None
 
 
+def fetch_chart_quote(
+    symbol: str,
+    chart_range: str = "1y",
+    interval: str = "1d",
+    force_refresh: bool = False,
+) -> dict[str, Any] | None:
+    global _LAST_FETCH_ERROR
+    key = (symbol.strip().upper(), chart_range)
+    now = time.time()
+    if not force_refresh:
+        with _CACHE_LOCK:
+            cached = _QUOTE_CACHE.get(key)
+            if cached and (now - cached[0]) < 45.0:
+                return cached[1]
+
+    errs: list[str] = []
+    out = None
+    try:
+        out = _fetch_tmx_quote_and_chart(symbol, chart_range)
+        if out is None:
+            errs.append("TMX returned empty series")
+    except Exception as exc:
+        errs.append(f"TMX: {exc}")
+
+    if out is None:
+        try:
+            out = _fetch_yfinance_chart(symbol, chart_range, interval)
+            if out is None:
+                errs.append("yfinance unavailable/empty")
+        except Exception as exc:
+            errs.append(f"yfinance: {exc}")
+
+    if out is None:
+        out = _fetch_yahoo_direct_chart(symbol, chart_range, interval)
+        if out is None:
+            errs.append("Yahoo direct rate-limited/empty")
+
+    if out is not None:
+        _LAST_FETCH_ERROR = None
+        with _CACHE_LOCK:
+            _QUOTE_CACHE[key] = (now, out)
+    else:
+        _LAST_FETCH_ERROR = "; ".join(errs) if errs else "All market feeds failed"
+    return out
+
+
 def fetch_fundamentals(symbol: str) -> dict[str, Any] | None:
+    sym_key = symbol.strip().upper()
+    now = time.time()
+    with _CACHE_LOCK:
+        cached = _FUND_CACHE.get(sym_key)
+        if cached and (now - cached[0]) < 600.0:
+            return cached[1]
+
+    # Try TMX quote fundamentals first
+    try:
+        tmx_sym = _to_tmx_symbol(sym_key)
+        q_res = _tmx_graphql(
+            """
+            query getQuoteBySymbol($symbol: String, $locale: String) {
+              getQuoteBySymbol(symbol: $symbol, locale: $locale) {
+                MarketCap peRatio dividendYield beta sector industry
+                shortDescription priceToBook eps returnOnEquity totalDebtToEquity
+              }
+            }
+            """,
+            {"symbol": tmx_sym, "locale": "en"},
+        )
+        qdata = (q_res or {}).get("getQuoteBySymbol")
+        if qdata:
+            fund_obj = _tmx_fundamentals_from_quote(qdata)
+            with _CACHE_LOCK:
+                _FUND_CACHE[sym_key] = (now, fund_obj)
+            return fund_obj
+    except Exception:
+        pass
+
+    # Secondary fallback via Yahoo Finance direct quoteSummary
     encoded = quote_plus(symbol.strip())
     modules = "summaryDetail,defaultKeyStatistics,financialData,assetProfile,price"
     for attempt in range(2):
@@ -169,7 +564,7 @@ def fetch_fundamentals(symbol: str) -> dict[str, Any] | None:
         crumb_q = f"&crumb={quote_plus(crumb)}" if crumb else ""
         url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{encoded}?modules={modules}{crumb_q}"
         try:
-            resp = _SESSION.get(url, timeout=10)
+            resp = _SESSION.get(url, timeout=8)
             if resp.status_code != 200:
                 continue
             results = resp.json().get("quoteSummary", {}).get("result") or []
@@ -186,7 +581,7 @@ def fetch_fundamentals(symbol: str) -> dict[str, Any] | None:
                 val = (obj.get(key) or {}).get("raw")
                 return float(val) if val is not None else None
 
-            return {
+            fund_obj = {
                 "sector": ap.get("sector"),
                 "industry": ap.get("industry"),
                 "summary": ap.get("longBusinessSummary"),
@@ -206,13 +601,21 @@ def fetch_fundamentals(symbol: str) -> dict[str, Any] | None:
                 "free_cash_flow": raw_val(fd, "freeCashflow"),
                 "revenue_growth": raw_val(fd, "revenueGrowth"),
                 "target_mean": raw_val(fd, "targetMeanPrice"),
+                "eps": raw_val(ks, "trailingEps"),
             }
+            with _CACHE_LOCK:
+                _FUND_CACHE[sym_key] = (now, fund_obj)
+            return fund_obj
         except Exception:
             continue
     return None
 
 
 def fetch_boc_macro() -> dict[str, float | None]:
+    global _MACRO_CACHE
+    now = time.time()
+    if _MACRO_CACHE and (now - _MACRO_CACHE[0]) < 600.0:
+        return _MACRO_CACHE[1]
     try:
         resp = requests.get(
             "https://www.bankofcanada.ca/valet/observations/FXCADUSD,V39079/json?recent=3",
@@ -228,30 +631,77 @@ def fetch_boc_macro() -> dict[str, float | None]:
                 cad_usd = float(row["FXCADUSD"]["v"])
             if boc_rate is None and row.get("V39079", {}).get("v"):
                 boc_rate = float(row["V39079"]["v"])
-        return {"cad_usd": cad_usd, "boc_rate": boc_rate}
+        res = {"cad_usd": cad_usd, "boc_rate": boc_rate}
+        _MACRO_CACHE = (now, res)
+        return res
     except Exception:
         return {"cad_usd": None, "boc_rate": None}
 
 
 def search_canadian_tickers(query: str) -> list[tuple[str, str]]:
-    try:
-        url = (
-            f"https://query1.finance.yahoo.com/v1/finance/search?q={quote_plus(query.strip())}"
-            "&quotesCount=15&newsCount=4&region=CA&lang=en-CA"
-        )
-        resp = _SESSION.get(url, timeout=8)
-        if resp.status_code != 200:
-            return []
-        out = []
-        for q in resp.json().get("quotes") or []:
-            sym = q.get("symbol", "")
-            exch = q.get("exchange", "")
-            if sym.upper().endswith((".TO", ".V", ".CN", ".NE")) or sym == "^GSPTSE" or exch in ("TOR", "VAN"):
-                nm = q.get("shortname") or q.get("longname") or sym
-                out.append((sym, nm))
-        return out
-    except Exception:
+    q_clean = query.strip()
+    if not q_clean:
         return []
+    q_upper = q_clean.upper()
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    # 1. Exact/direct lookup on TMX GraphQL (works for unlisted TSX/TSXV tickers like L.TO, T.TO, AC.TO)
+    try:
+        tmx_sym = _to_tmx_symbol(q_upper)
+        q_res = _tmx_graphql(
+            """
+            query getQuoteBySymbol($symbol: String, $locale: String) {
+              getQuoteBySymbol(symbol: $symbol, locale: $locale) {
+                symbol name exShortName price
+              }
+            }
+            """,
+            {"symbol": tmx_sym, "locale": "en"},
+        )
+        qdata = (q_res or {}).get("getQuoteBySymbol")
+        if qdata and qdata.get("symbol"):
+            ex = (qdata.get("exShortName") or "TSX").upper()
+            suffix = ".V" if "TSXV" in ex else ".TO"
+            canon = q_upper if q_upper.endswith((".TO", ".V", ".CN", ".NE")) or q_upper.startswith("^") else f"{qdata['symbol']}{suffix}"
+            out.append((canon, qdata.get("name") or canon))
+            seen.add(canon)
+    except Exception:
+        pass
+
+    # 2. Full TMX/TSXV directory match (2,000+ listed securities)
+    for _, r in DIRECTORY_DF.iterrows():
+        if (
+            q_upper in r["symbol"].upper()
+            or q_upper in r["name"].upper()
+            or q_upper in r["sector"].upper()
+        ):
+            if r["symbol"] not in seen:
+                out.append((r["symbol"], r["name"]))
+                seen.add(r["symbol"])
+                if len(out) >= 40:
+                    break
+
+    # 3. Yahoo Finance search bonus (if not rate-limited)
+    if not out:
+        try:
+            url = (
+                f"https://query1.finance.yahoo.com/v1/finance/search?q={quote_plus(q_clean)}"
+                "&quotesCount=15&newsCount=4&region=CA&lang=en-CA"
+            )
+            resp = _SESSION.get(url, timeout=6)
+            if resp.status_code == 200:
+                for q in resp.json().get("quotes") or []:
+                    sym = (q.get("symbol") or "").upper()
+                    exch = q.get("exchange", "")
+                    if sym.endswith((".TO", ".V", ".CN", ".NE")) or sym == "^GSPTSE" or exch in ("TOR", "VAN"):
+                        if sym not in seen:
+                            nm = q.get("shortname") or q.get("longname") or sym
+                            out.append((sym, nm))
+                            seen.add(sym)
+        except Exception:
+            pass
+    return out
 
 
 # ------------------------------------------------------------------------------
@@ -498,6 +948,11 @@ body { background-color: #0B1622; color: #F1F5F9; font-family: 'Plus Jakarta San
 .warn-txt { color: #F59E0B; font-weight: 600; }
 .cyan-txt { color: #38BDF8; font-weight: 600; }
 .form-control, .form-select { background-color: #0B1622 !important; color: #F1F5F9 !important; border-color: #233B54 !important; }
+.selectize-input { background-color: #0B1622 !important; color: #F1F5F9 !important; border-color: #233B54 !important; }
+.selectize-input input { color: #F1F5F9 !important; }
+.selectize-dropdown { background-color: #102030 !important; color: #F1F5F9 !important; border-color: #233B54 !important; }
+.selectize-dropdown .option { color: #F1F5F9 !important; }
+.selectize-dropdown .active { background-color: #162A3E !important; color: #10B981 !important; }
 """
 
 app_ui = ui.page_navbar(
@@ -505,8 +960,14 @@ app_ui = ui.page_navbar(
         "Markets & Analyzer",
         ui.layout_sidebar(
             ui.sidebar(
-                ui.input_select("selected_symbol", "Active Canadian Equity", choices=SYMBOL_CHOICES, selected="RY.TO"),
-                ui.input_text("custom_search", "Search TSX / TSXV Ticker", placeholder="e.g. L.TO, HIVE.V, BCE.TO"),
+                ui.input_selectize(
+                    "selected_symbol",
+                    f"Active Canadian Equity ({len(SYMBOL_CHOICES):,} TSX/TSXV)",
+                    choices=SYMBOL_CHOICES,
+                    selected="RY.TO",
+                    options={"maxOptions": 150, "placeholder": "Type ticker or company..."},
+                ),
+                ui.input_text("custom_search", "Search Any TSX / TSXV Ticker", placeholder="e.g. L.TO, CTC.A.TO, ONE.V"),
                 ui.input_action_button("search_btn", "Search Exchange", class_="btn-outline-info btn-sm w-100 mb-2"),
                 ui.output_ui("search_status_ui"),
                 ui.hr(),
@@ -561,15 +1022,25 @@ app_ui = ui.page_navbar(
         ui.card(
             ui.card_header("Multi-Factor TSX / TSXV Technical Scanner"),
             ui.layout_columns(
-                ui.input_select("screener_sector", "Sector", choices=["All"] + sorted(TSX_UNIVERSE["sector"].unique().tolist())),
+                ui.input_select(
+                    "screener_scope",
+                    "Universe Scope",
+                    choices={
+                        "CURATED": "Curated TSX/TSXV Blue-Chips (24)",
+                        "TSX": "All TSX Directory (Top 40 Match)",
+                        "TSXV": "All TSXV Directory (Top 40 Match)",
+                    },
+                ),
+                ui.input_select("screener_sector", "Curated Sector", choices=["All"] + sorted(TSX_UNIVERSE["sector"].unique().tolist())),
+                ui.input_text("screener_keyword", "Keyword / Ticker Filter", placeholder="Optional (e.g. Gold, Bank, .UN)"),
                 ui.input_select(
                     "screener_filter",
                     "Signal Filter",
                     choices=["All", "Bullish (Buy / Strong Buy)", "Oversold (RSI <= 35)", "Overbought (RSI >= 70)"],
                 ),
-                ui.div(ui.br(), ui.input_action_button("run_screener_btn", "Scan Live TSX Universe", class_="btn-success w-100")),
-                col_widths=[4, 4, 4],
+                col_widths=[3, 3, 3, 3],
             ),
+            ui.input_action_button("run_screener_btn", "Scan Live TSX / TSXV Universe", class_="btn-success mt-2"),
             ui.br(),
             ui.output_data_frame("screener_table"),
         ),
@@ -588,7 +1059,13 @@ app_ui = ui.page_navbar(
         ui.layout_columns(
             ui.card(
                 ui.card_header("Arm Price or Technical Alert"),
-                ui.input_select("alert_symbol", "Ticker", choices=TSX_UNIVERSE["symbol"].tolist(), selected="RY.TO"),
+                ui.input_selectize(
+                    "alert_symbol",
+                    "Ticker (2,000+ TSX/TSXV)",
+                    choices=SYMBOL_CHOICES,
+                    selected="RY.TO",
+                    options={"maxOptions": 150, "placeholder": "Type ticker or company..."},
+                ),
                 ui.input_select(
                     "alert_condition",
                     "Condition",
@@ -649,15 +1126,24 @@ def server(input, output, session):
 
     macro_rv = reactive.value(fetch_boc_macro())
     tsx_index_rv = reactive.value(fetch_chart_quote("^GSPTSE", "3mo", "1d"))
+    last_refresh_n = reactive.value(0)
 
     @reactive.calc
     def active_data():
-        _ = input.refresh_symbol_btn()
+        refresh_n = input.refresh_symbol_btn()
         sym = input.selected_symbol()
         rng = input.chart_range()
         interval = "15m" if rng == "5d" else ("1wk" if rng == "5y" else "1d")
 
-        quote_obj = fetch_chart_quote(sym, rng, interval)
+        is_forced = False
+        with reactive.isolate():
+            if refresh_n > last_refresh_n():
+                last_refresh_n.set(refresh_n)
+                is_forced = True
+                macro_rv.set(fetch_boc_macro())
+                tsx_index_rv.set(fetch_chart_quote("^GSPTSE", "3mo", "1d", force_refresh=True))
+
+        quote_obj = fetch_chart_quote(sym, rng, interval, force_refresh=is_forced)
         if quote_obj is None:
             return None
         tech = compute_technicals(quote_obj)
@@ -675,9 +1161,10 @@ def server(input, output, session):
         if hits:
             merged = dict(SYMBOL_CHOICES)
             for sym, nm in hits:
-                merged[sym] = f"{sym} — {nm}"
-            ui.update_select("selected_symbol", choices=merged, selected=hits[0][0])
-            ui.update_select("alert_symbol", choices=list(merged.keys()), selected=hits[0][0])
+                if sym not in merged:
+                    merged[sym] = f"{sym} — {nm}"
+            ui.update_selectize("selected_symbol", choices=merged, selected=hits[0][0])
+            ui.update_selectize("alert_symbol", choices=merged, selected=hits[0][0])
             search_msg_rv.set(f"Found {len(hits)} Canadian matches; loaded {hits[0][0]}.")
         else:
             search_msg_rv.set("No TSX / TSXV tickers matched.")
@@ -711,7 +1198,8 @@ def server(input, output, session):
     def stock_header_ui():
         dat = active_data()
         if dat is None:
-            return ui.div("Unable to load live TSX quote. Retry.", class_="alert alert-danger")
+            detail = f" ({_LAST_FETCH_ERROR})" if _LAST_FETCH_ERROR else ""
+            return ui.div(f"Unable to load live TSX quote{detail}. Click Refresh Live Quote to retry.", class_="alert alert-danger")
         q = dat["quote"]
         t = dat["tech"]
         cls = "bull-txt" if q["change"] >= 0 else "bear-txt"
@@ -832,13 +1320,24 @@ def server(input, output, session):
         def fmt(v: float | None, mult: float = 1.0, suffix: str = "") -> str:
             return "--" if v is None else f"{v * mult:.2f}{suffix}"
 
+        def fmt_cap(v: float | None) -> str:
+            if v is None:
+                return "--"
+            if v >= 1e12:
+                return f"${v / 1e12:.2f}T"
+            if v >= 1e9:
+                return f"${v / 1e9:.2f}B"
+            if v >= 1e6:
+                return f"${v / 1e6:.1f}M"
+            return f"${v:,.0f}"
+
         upside_node = (
             ui.span(
                 f"Analyst Target Upside: {ev['upside_pct']:+.1f}%",
                 class_="bull-txt mono-num" if ev["upside_pct"] >= 0 else "bear-txt mono-num",
             )
             if ev["upside_pct"] is not None
-            else None
+            else ui.span(f"Market Cap: {fmt_cap(f.get('market_cap'))}", class_="cyan-txt mono-num")
         )
         return ui.TagList(
             ui.div(
@@ -851,7 +1350,7 @@ def server(input, output, session):
             ),
             ui.layout_columns(
                 ui.div(ui.div("Trailing P/E", class_="small text-secondary"), ui.h5(fmt(f.get("trailing_pe")), class_="mono-num"), class_="metric-box"),
-                ui.div(ui.div("Forward P/E", class_="small text-secondary"), ui.h5(fmt(f.get("forward_pe")), class_="mono-num"), class_="metric-box"),
+                ui.div(ui.div("EPS (TTM)", class_="small text-secondary"), ui.h5(fmt(f.get("eps")), class_="mono-num"), class_="metric-box"),
                 ui.div(ui.div("Dividend Yield", class_="small text-secondary"), ui.h5(fmt(f.get("dividend_yield"), 100.0, "%"), class_="mono-num"), class_="metric-box"),
                 ui.div(ui.div("ROE", class_="small text-secondary"), ui.h5(fmt(f.get("roe"), 100.0, "%"), class_="mono-num"), class_="metric-box"),
                 col_widths=[3, 3, 3, 3],
@@ -859,9 +1358,18 @@ def server(input, output, session):
             ui.br(),
             ui.layout_columns(
                 ui.div(ui.div("Price / Book", class_="small text-secondary"), ui.h5(fmt(f.get("price_to_book")), class_="mono-num"), class_="metric-box"),
-                ui.div(ui.div("Profit Margin", class_="small text-secondary"), ui.h5(fmt(f.get("profit_margin"), 100.0, "%"), class_="mono-num"), class_="metric-box"),
+                ui.div(ui.div("Beta (5Y)", class_="small text-secondary"), ui.h5(fmt(f.get("beta")), class_="mono-num"), class_="metric-box"),
                 ui.div(ui.div("Debt / Equity", class_="small text-secondary"), ui.h5(fmt(f.get("debt_to_equity"), 1.0, "%"), class_="mono-num"), class_="metric-box"),
-                ui.div(ui.div("Analyst Target", class_="small text-secondary"), ui.h5(fmt(f.get("target_mean")), class_="mono-num"), class_="metric-box"),
+                ui.div(
+                    ui.div("Analyst Target" if f.get("target_mean") is not None else "52W Low / High", class_="small text-secondary"),
+                    ui.h5(
+                        fmt(f.get("target_mean"))
+                        if f.get("target_mean") is not None
+                        else f"${dat['quote']['low_52w']:.2f} / ${dat['quote']['high_52w']:.2f}",
+                        class_="mono-num",
+                    ),
+                    class_="metric-box",
+                ),
                 col_widths=[3, 3, 3, 3],
             ),
             ui.br(),
@@ -934,9 +1442,23 @@ def server(input, output, session):
     @reactive.effect
     @reactive.event(input.run_screener_btn)
     def _run_screener():
-        df_u = TSX_UNIVERSE.copy()
-        if input.screener_sector() != "All":
-            df_u = df_u[df_u["sector"] == input.screener_sector()]
+        scope = input.screener_scope()
+        if scope == "CURATED":
+            df_u = TSX_UNIVERSE.copy()
+            if input.screener_sector() != "All":
+                df_u = df_u[df_u["sector"] == input.screener_sector()]
+        else:
+            df_u = DIRECTORY_DF[DIRECTORY_DF["exchange"] == scope].copy()
+
+        kw = (input.screener_keyword() or "").strip().upper()
+        if kw:
+            mask = (
+                df_u["symbol"].str.upper().str.contains(kw, regex=False, na=False)
+                | df_u["name"].str.upper().str.contains(kw, regex=False, na=False)
+            )
+            df_u = df_u[mask]
+        df_u = df_u.head(40)
+
         rows = []
         for _, r in df_u.iterrows():
             q = fetch_chart_quote(r["symbol"], "3mo", "1d")
