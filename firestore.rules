@@ -1,0 +1,133 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global safety net: deny all reads and writes by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidWatchlistItem(data, userId) {
+      return data.userId is string && data.userId == userId &&
+             data.symbol is string && data.symbol.size() >= 1 && data.symbol.size() <= 20 &&
+             data.name is string && data.name.size() >= 1 && data.name.size() <= 120 &&
+             data.exchange is string && data.exchange.size() >= 1 && data.exchange.size() <= 24 &&
+             (!('sector' in data) || (data.sector is string && data.sector.size() <= 80)) &&
+             (!('notes' in data) || (data.notes is string && data.notes.size() <= 300)) &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    function isValidPriceAlert(data, userId) {
+      return data.userId is string && data.userId == userId &&
+             data.symbol is string && data.symbol.size() >= 1 && data.symbol.size() <= 20 &&
+             data.stockName is string && data.stockName.size() >= 1 && data.stockName.size() <= 120 &&
+             data.conditionType in ['ABOVE', 'BELOW', 'PCT_GAIN', 'PCT_DROP', 'RSI_BELOW', 'RSI_ABOVE'] &&
+             data.targetValue is number &&
+             data.isActive is bool &&
+             data.triggeredCount is int && data.triggeredCount >= 0 &&
+             (!('lastTriggeredPrice' in data) || data.lastTriggeredPrice is number) &&
+             (!('lastTriggeredAt' in data) || data.lastTriggeredAt == null || (data.lastTriggeredAt is timestamp && data.lastTriggeredAt <= request.time)) &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    function isValidAlertEvent(data, userId) {
+      return data.userId is string && data.userId == userId &&
+             data.alertId is string && data.alertId.size() >= 1 && data.alertId.size() <= 128 &&
+             data.symbol is string && data.symbol.size() >= 1 && data.symbol.size() <= 20 &&
+             data.conditionType in ['ABOVE', 'BELOW', 'PCT_GAIN', 'PCT_DROP', 'RSI_BELOW', 'RSI_ABOVE'] &&
+             data.triggerPrice is number &&
+             data.targetValue is number &&
+             data.message is string && data.message.size() >= 1 && data.message.size() <= 240 &&
+             data.acknowledged is bool &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             (!('updatedAt' in data) || (data.updatedAt is timestamp && data.updatedAt <= request.time));
+    }
+
+    match /users/{userId}/watchlist/{tickerId} {
+      allow list: if isOwner(userId);
+      allow get: if isOwner(userId) && isValidId(tickerId);
+
+      allow create: if isOwner(userId) &&
+                       isValidId(tickerId) &&
+                       incoming().keys().hasAll(['userId', 'symbol', 'name', 'exchange', 'createdAt', 'updatedAt']) &&
+                       incoming().keys().hasOnly(['userId', 'symbol', 'name', 'exchange', 'sector', 'notes', 'createdAt', 'updatedAt']) &&
+                       isValidWatchlistItem(incoming(), userId);
+
+      allow update: if isOwner(userId) &&
+                       isValidId(tickerId) &&
+                       isValidWatchlistItem(incoming(), userId) &&
+                       incoming().userId == existing().userId &&
+                       incoming().symbol == existing().symbol &&
+                       incoming().createdAt == existing().createdAt &&
+                       incoming().diff(existing()).affectedKeys().hasOnly(['name', 'exchange', 'sector', 'notes', 'updatedAt']);
+
+      allow delete: if isOwner(userId) && isValidId(tickerId);
+    }
+
+    match /users/{userId}/alerts/{alertId} {
+      allow list: if isOwner(userId);
+      allow get: if isOwner(userId) && isValidId(alertId);
+
+      allow create: if isOwner(userId) &&
+                       isValidId(alertId) &&
+                       incoming().keys().hasAll(['userId', 'symbol', 'stockName', 'conditionType', 'targetValue', 'isActive', 'triggeredCount', 'createdAt', 'updatedAt']) &&
+                       incoming().keys().hasOnly(['userId', 'symbol', 'stockName', 'conditionType', 'targetValue', 'isActive', 'triggeredCount', 'lastTriggeredPrice', 'lastTriggeredAt', 'createdAt', 'updatedAt']) &&
+                       isValidPriceAlert(incoming(), userId);
+
+      allow update: if isOwner(userId) &&
+                       isValidId(alertId) &&
+                       isValidPriceAlert(incoming(), userId) &&
+                       incoming().userId == existing().userId &&
+                       incoming().symbol == existing().symbol &&
+                       incoming().createdAt == existing().createdAt &&
+                       incoming().diff(existing()).affectedKeys().hasOnly(['stockName', 'conditionType', 'targetValue', 'isActive', 'triggeredCount', 'lastTriggeredPrice', 'lastTriggeredAt', 'updatedAt']);
+
+      allow delete: if isOwner(userId) && isValidId(alertId);
+    }
+
+    match /users/{userId}/alertEvents/{eventId} {
+      allow list: if isOwner(userId);
+      allow get: if isOwner(userId) && isValidId(eventId);
+
+      allow create: if isOwner(userId) &&
+                       isValidId(eventId) &&
+                       incoming().keys().hasAll(['userId', 'alertId', 'symbol', 'conditionType', 'triggerPrice', 'targetValue', 'message', 'acknowledged', 'createdAt']) &&
+                       incoming().keys().hasOnly(['userId', 'alertId', 'symbol', 'conditionType', 'triggerPrice', 'targetValue', 'message', 'acknowledged', 'createdAt', 'updatedAt']) &&
+                       isValidAlertEvent(incoming(), userId);
+
+      allow update: if isOwner(userId) &&
+                       isValidId(eventId) &&
+                       isValidAlertEvent(incoming(), userId) &&
+                       incoming().userId == existing().userId &&
+                       incoming().alertId == existing().alertId &&
+                       incoming().symbol == existing().symbol &&
+                       incoming().createdAt == existing().createdAt &&
+                       incoming().diff(existing()).affectedKeys().hasOnly(['acknowledged', 'updatedAt']);
+
+      allow delete: if isOwner(userId) && isValidId(eventId);
+    }
+  }
+}

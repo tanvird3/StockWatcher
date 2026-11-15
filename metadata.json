@@ -1,0 +1,6 @@
+{
+  "name": "MaplePulse",
+  "description": "Canadian equity analytics for TSX and TSXV stocks with technical indicators, fundamental valuation, quantitative forecasting, and real-time price alerts.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

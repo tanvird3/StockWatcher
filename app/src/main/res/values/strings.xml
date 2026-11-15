@@ -1,0 +1,20 @@
+<resources>
+    <string name="app_name">MaplePulse</string>
+    <string name="app_tagline">Canadian TSX &amp; TSXV Equity Intelligence</string>
+    <string name="sign_in_google">Sign in with Google</string>
+    <string name="sign_in_subtitle">Sync your Canadian stock watchlists, custom technical price alerts, and alert logs securely across sessions.</string>
+    <string name="nav_markets">Markets</string>
+    <string name="nav_watchlist">Watchlist</string>
+    <string name="nav_alerts">Alerts</string>
+    <string name="nav_screener">Screener</string>
+    <string name="tab_technical">Technical</string>
+    <string name="tab_fundamental">Fundamental</string>
+    <string name="tab_forecast">Forecast</string>
+    <string name="search_tsx_hint">Search TSX / TSXV ticker or company (e.g. RY.TO, SHOP.TO)…</string>
+    <string name="alert_channel_name">TSX Price &amp; Technical Alerts</string>
+    <string name="alert_channel_desc">Real-time notifications when watched Canadian equities cross price or RSI thresholds.</string>
+    <string name="no_alerts_title">No Active Price Alerts</string>
+    <string name="no_alerts_desc">Create real-time price target, % move, or RSI alerts on any TSX or TSXV equity.</string>
+    <string name="no_watchlist_title">Build Your Canadian Watchlist</string>
+    <string name="no_watchlist_desc">Pin TSX blue chips, dividend aristocrats, or TSXV growth stocks for instant monitoring.</string>
+</resources>

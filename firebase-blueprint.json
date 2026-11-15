@@ -1,0 +1,193 @@
+{
+  "entities": {
+    "WatchlistItem": {
+      "title": "WatchlistItem",
+      "description": "A Canadian equity (TSX/TSXV) tracked by the authenticated user.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "UID of the owning authenticated user."
+        },
+        "symbol": {
+          "type": "string",
+          "description": "Yahoo/TMX ticker symbol such as RY.TO or SHOP.TO."
+        },
+        "name": {
+          "type": "string",
+          "description": "Company or ETF name."
+        },
+        "exchange": {
+          "type": "string",
+          "description": "Exchange code such as TSX or TSXV."
+        },
+        "sector": {
+          "type": "string",
+          "description": "GICS or market sector classification."
+        },
+        "notes": {
+          "type": "string",
+          "description": "Optional user thesis or analyst note."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when added (FieldValue.serverTimestamp())."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when last updated (FieldValue.serverTimestamp())."
+        }
+      },
+      "required": ["userId", "symbol", "name", "exchange", "createdAt", "updatedAt"]
+    },
+    "PriceAlert": {
+      "title": "PriceAlert",
+      "description": "A real-time price or technical indicator alert rule configured by the user.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "UID of the owning authenticated user."
+        },
+        "symbol": {
+          "type": "string",
+          "description": "Canadian equity ticker symbol."
+        },
+        "stockName": {
+          "type": "string",
+          "description": "Display name of the tracked equity."
+        },
+        "conditionType": {
+          "type": "string",
+          "enum": ["ABOVE", "BELOW", "PCT_GAIN", "PCT_DROP", "RSI_BELOW", "RSI_ABOVE"],
+          "description": "Trigger condition for the alert rule."
+        },
+        "targetValue": {
+          "type": "number",
+          "description": "Threshold price (CAD), percentage change, or RSI level."
+        },
+        "isActive": {
+          "type": "boolean",
+          "description": "Whether the alert rule is actively monitored."
+        },
+        "triggeredCount": {
+          "type": "integer",
+          "description": "Number of times this alert has fired."
+        },
+        "lastTriggeredPrice": {
+          "type": "number",
+          "description": "Last market price when this alert triggered."
+        },
+        "lastTriggeredAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when last triggered."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when created (FieldValue.serverTimestamp())."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when last modified (FieldValue.serverTimestamp())."
+        }
+      },
+      "required": [
+        "userId",
+        "symbol",
+        "stockName",
+        "conditionType",
+        "targetValue",
+        "isActive",
+        "triggeredCount",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "AlertEvent": {
+      "title": "AlertEvent",
+      "description": "Historical log entry recorded when a real-time price or indicator alert fires.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "UID of the owning authenticated user."
+        },
+        "alertId": {
+          "type": "string",
+          "description": "Document ID of the parent PriceAlert rule."
+        },
+        "symbol": {
+          "type": "string",
+          "description": "Ticker symbol that triggered the alert."
+        },
+        "conditionType": {
+          "type": "string",
+          "enum": ["ABOVE", "BELOW", "PCT_GAIN", "PCT_DROP", "RSI_BELOW", "RSI_ABOVE"],
+          "description": "Condition type that triggered."
+        },
+        "triggerPrice": {
+          "type": "number",
+          "description": "Live CAD price at the moment of trigger."
+        },
+        "targetValue": {
+          "type": "number",
+          "description": "Configured threshold value."
+        },
+        "message": {
+          "type": "string",
+          "description": "Human-readable alert summary."
+        },
+        "acknowledged": {
+          "type": "boolean",
+          "description": "Whether the user dismissed or acknowledged this alert."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when event occurred (FieldValue.serverTimestamp())."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when acknowledged (FieldValue.serverTimestamp())."
+        }
+      },
+      "required": [
+        "userId",
+        "alertId",
+        "symbol",
+        "conditionType",
+        "triggerPrice",
+        "targetValue",
+        "message",
+        "acknowledged",
+        "createdAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/watchlist/{tickerId}": {
+      "schema": {
+        "$ref": "#/entities/WatchlistItem"
+      },
+      "description": "User-scoped watchlist of Canadian TSX/TSXV equities."
+    },
+    "/users/{userId}/alerts/{alertId}": {
+      "schema": {
+        "$ref": "#/entities/PriceAlert"
+      },
+      "description": "User-scoped real-time price and RSI alert rules."
+    },
+    "/users/{userId}/alertEvents/{eventId}": {
+      "schema": {
+        "$ref": "#/entities/AlertEvent"
+      },
+      "description": "User-scoped log of triggered alert notifications."
+    }
+  }
+}
