@@ -5,7 +5,10 @@
 
 from __future__ import annotations
 
+import concurrent.futures
+import difflib
 import math
+import string
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -63,6 +66,17 @@ TSX_UNIVERSE = pd.DataFrame(
 _SKIP_INSTRUMENT_TOKENS = (".PR.", ".PF.", ".DB", ".WT", ".RT", ".NT", ".NO")
 
 
+def _fetch_tmx_prefix_bucket(ex: str, ch: str, hdrs: dict[str, str]) -> tuple[str, list[dict[str, Any]]]:
+    url = f"https://www.tsx.com/json/company-directory/search/{ex}/^{ch}"
+    try:
+        resp = requests.get(url, headers=hdrs, timeout=8)
+        if resp.status_code != 200:
+            return ex, []
+        return ex, (resp.json().get("results") or [])
+    except Exception:
+        return ex, []
+
+
 def load_full_tsx_directory() -> tuple[pd.DataFrame, dict[str, str]]:
     rows: list[tuple[str, str, str, str]] = [
         (r["symbol"], r["name"], r["exchange"], r["sector"]) for _, r in TSX_UNIVERSE.iterrows()
@@ -72,10 +86,6 @@ def load_full_tsx_directory() -> tuple[pd.DataFrame, dict[str, str]]:
         r[0]: f"{r[0]} — {r[1]} ({r[2]})" for r in rows
     }
 
-    dir_urls = [
-        ("TSX", ".TO", "https://www.tsx.com/json/company-directory/search/tsx/.*"),
-        ("TSXV", ".V", "https://www.tsx.com/json/company-directory/search/tsxv/.*"),
-    ]
     hdrs = {
         "User-Agent": (
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -83,30 +93,39 @@ def load_full_tsx_directory() -> tuple[pd.DataFrame, dict[str, str]]:
         ),
         "Referer": "https://www.tsx.com/",
     }
-    for exch, suffix, url in dir_urls:
-        try:
-            resp = requests.get(url, headers=hdrs, timeout=10)
-            if resp.status_code != 200:
-                continue
-            results = resp.json().get("results") or []
-            for item in results:
-                comp_name = (item.get("name") or "").strip()
-                instruments = item.get("instruments") or [
-                    {"symbol": item.get("symbol"), "name": comp_name}
-                ]
-                for inst in instruments:
-                    raw_sym = (inst.get("symbol") or "").strip().upper()
-                    if not raw_sym or any(tok in raw_sym for tok in _SKIP_INSTRUMENT_TOKENS):
-                        continue
-                    canon = f"{raw_sym}{suffix}"
-                    if canon in seen:
-                        continue
-                    seen.add(canon)
-                    label_name = comp_name or (inst.get("name") or raw_sym).strip()
-                    rows.append((canon, label_name, exch, f"{exch} Listed"))
-                    choices[canon] = f"{canon} — {label_name} ({exch})"
-        except Exception:
-            continue
+    prefixes = list(string.ascii_uppercase + string.digits)
+    tasks = [("tsx", ch) for ch in prefixes] + [("tsxv", ch) for ch in prefixes]
+
+    raw_buckets: dict[str, list[dict[str, Any]]] = {"tsx": [], "tsxv": []}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+        futs = [pool.submit(_fetch_tmx_prefix_bucket, ex, ch, hdrs) for ex, ch in tasks]
+        for fut in concurrent.futures.as_completed(futs):
+            ex, items = fut.result()
+            raw_buckets[ex].extend(items)
+
+    extra_rows: list[tuple[str, str, str, str]] = []
+    for ex, exch_label, suffix in (("tsx", "TSX", ".TO"), ("tsxv", "TSXV", ".V")):
+        for item in raw_buckets[ex]:
+            comp_name = (item.get("name") or "").strip()
+            instruments = item.get("instruments") or [
+                {"symbol": item.get("symbol"), "name": comp_name}
+            ]
+            for inst in instruments:
+                raw_sym = (inst.get("symbol") or "").strip().upper()
+                if not raw_sym or any(tok in raw_sym for tok in _SKIP_INSTRUMENT_TOKENS):
+                    continue
+                canon = f"{raw_sym}{suffix}"
+                if canon in seen:
+                    continue
+                seen.add(canon)
+                label_name = comp_name or (inst.get("name") or raw_sym).strip()
+                sector_label = "CDR (CAD Hedged)" if "CDR" in label_name.upper() else f"{exch_label} Listed"
+                extra_rows.append((canon, label_name, exch_label, sector_label))
+
+    extra_rows.sort(key=lambda r: r[0])
+    for r in extra_rows:
+        rows.append(r)
+        choices[r[0]] = f"{r[0]} — {r[1]} ({r[2]})"
 
     return pd.DataFrame(rows, columns=["symbol", "name", "exchange", "sector"]), choices
 
@@ -669,18 +688,34 @@ def search_canadian_tickers(query: str) -> list[tuple[str, str]]:
     except Exception:
         pass
 
-    # 2. Full TMX/TSXV directory match (2,000+ listed securities)
+    # 2. Multi-token match across full TMX/TSXV directory (3,700+ listed issuers)
+    tokens = [t for t in q_upper.replace(",", " ").split() if t]
     for _, r in DIRECTORY_DF.iterrows():
-        if (
-            q_upper in r["symbol"].upper()
-            or q_upper in r["name"].upper()
-            or q_upper in r["sector"].upper()
-        ):
+        hay = f"{r['symbol']} {r['name']} {r['sector']}".upper()
+        if all(tok in hay for tok in tokens):
             if r["symbol"] not in seen:
                 out.append((r["symbol"], r["name"]))
                 seen.add(r["symbol"])
                 if len(out) >= 40:
                     break
+
+    # 3. Typo-tolerant fuzzy match (e.g. "nvdia cdr" -> "Nvidia CDR (CAD Hedged)")
+    if not out and tokens:
+        scored: list[tuple[float, str, str]] = []
+        for _, r in DIRECTORY_DF.iterrows():
+            words = f"{r['symbol'].split('.')[0]} {r['name']}".upper().split()
+            token_scores = [
+                max((difflib.SequenceMatcher(None, tok, w).ratio() for w in words), default=0.0)
+                for tok in tokens
+            ]
+            avg_s = sum(token_scores) / len(token_scores)
+            if min(token_scores) >= 0.72 and avg_s >= 0.78:
+                scored.append((avg_s, r["symbol"], r["name"]))
+        scored.sort(reverse=True)
+        for _, sym, nm in scored[:25]:
+            if sym not in seen:
+                out.append((sym, nm))
+                seen.add(sym)
 
     # 3. Yahoo Finance search bonus (if not rate-limited)
     if not out:
@@ -965,9 +1000,10 @@ app_ui = ui.page_navbar(
                     f"Active Canadian Equity ({len(SYMBOL_CHOICES):,} TSX/TSXV)",
                     choices=SYMBOL_CHOICES,
                     selected="RY.TO",
-                    options={"maxOptions": 150, "placeholder": "Type ticker or company..."},
+                    options={"maxOptions": 5000, "placeholder": "Backspace & type ticker/name (e.g. NVDA, RY)..."},
                 ),
-                ui.input_text("custom_search", "Search Any TSX / TSXV Ticker", placeholder="e.g. L.TO, CTC.A.TO, ONE.V"),
+                ui.div("Tip: Backspace in selector above or search below.", class_="small text-secondary mb-2"),
+                ui.input_text("custom_search", "Search Any TSX / TSXV / CDR", placeholder="e.g. nvidia cdr, L.TO, CTC.A, ONE"),
                 ui.input_action_button("search_btn", "Search Exchange", class_="btn-outline-info btn-sm w-100 mb-2"),
                 ui.output_ui("search_status_ui"),
                 ui.hr(),
@@ -1027,6 +1063,7 @@ app_ui = ui.page_navbar(
                     "Universe Scope",
                     choices={
                         "CURATED": "Curated TSX/TSXV Blue-Chips (24)",
+                        "CDR": "Canadian CDRs (CAD Hedged)",
                         "TSX": "All TSX Directory (Top 40 Match)",
                         "TSXV": "All TSXV Directory (Top 40 Match)",
                     },
@@ -1061,10 +1098,10 @@ app_ui = ui.page_navbar(
                 ui.card_header("Arm Price or Technical Alert"),
                 ui.input_selectize(
                     "alert_symbol",
-                    "Ticker (2,000+ TSX/TSXV)",
+                    f"Ticker ({len(SYMBOL_CHOICES):,} TSX/TSXV)",
                     choices=SYMBOL_CHOICES,
                     selected="RY.TO",
-                    options={"maxOptions": 150, "placeholder": "Type ticker or company..."},
+                    options={"maxOptions": 5000, "placeholder": "Backspace & type ticker/name..."},
                 ),
                 ui.input_select(
                     "alert_condition",
@@ -1447,6 +1484,8 @@ def server(input, output, session):
             df_u = TSX_UNIVERSE.copy()
             if input.screener_sector() != "All":
                 df_u = df_u[df_u["sector"] == input.screener_sector()]
+        elif scope == "CDR":
+            df_u = DIRECTORY_DF[DIRECTORY_DF["sector"] == "CDR (CAD Hedged)"].copy()
         else:
             df_u = DIRECTORY_DF[DIRECTORY_DF["exchange"] == scope].copy()
 
